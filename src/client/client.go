@@ -78,9 +78,22 @@ func parseBinaryMetrics(data []byte) {
 	}
 }
 
+// The readDelimited function is designed to read Protocol Buffer messages that are encoded in a delimited format.
+// This format is used by Prometheus when sending metrics in binary form.
+//
+// Parameters:
+//   - r io.Reader: The source from which to read the delimited message.
+//   - m proto.Message: A Protocol Buffer message to unmarshal the data into.
 func readDelimited(r io.Reader, m proto.Message) (int, error) {
+	// a 1-byte buffer to read data one byte at a time.
 	buf := make([]byte, 1)
 	size := uint64(0)
+	// This loop implements varint decoding. Varints are used to encode integers using a variable number of bytes.
+	// Each byte uses 7 bits for the number and 1 bit to indicate if more bytes follow.
+	// - It reads one byte at a time.
+	// - The lower 7 bits of each byte are used to construct the size.
+	// - If the most significant bit (0x80) is set, it means another byte follows.
+	// - This continues until a byte with the most significant bit unset is found.
 	for shift := uint(0); ; shift += 7 {
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return 0, err
@@ -91,6 +104,7 @@ func readDelimited(r io.Reader, m proto.Message) (int, error) {
 			break
 		}
 	}
+	// After reading the size, if it's greater than 0, proceed to read the actual message:
 	if size > 0 {
 		buf = make([]byte, size)
 		if _, err := io.ReadFull(r, buf); err != nil {
