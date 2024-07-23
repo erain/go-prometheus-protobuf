@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
+	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 
 	"github.com/golang/protobuf/proto"
@@ -12,105 +12,105 @@ import (
 )
 
 func main() {
-	// Text format
-	fmt.Println("Text format:")
-	textMetrics := getMetrics("text/plain")
-	fmt.Println(string(textMetrics))
+	url := "http://localhost:8080/metrics"
 
-	// Binary format
-	fmt.Println("\nBinary format:")
-	binaryMetrics := getMetrics("application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited")
-	parseBinaryMetrics(binaryMetrics)
-}
-
-func getMetrics(acceptHeader string) []byte {
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", "http://localhost:8080/metrics", nil)
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		panic(err)
+		fmt.Printf("Error creating request: %v\n", err)
+		return
 	}
-	req.Header.Set("Accept", acceptHeader)
+	req.Header.Set("Accept", "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited")
 
+	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		panic(err)
+		fmt.Printf("Error fetching metrics: %v\n", err)
+		return
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	metrics, err := parseBinaryMetrics(resp.Body)
 	if err != nil {
-		panic(err)
+		fmt.Printf("Error parsing metrics: %v\n", err)
+		return
 	}
 
-	return body
-}
-
-func parseBinaryMetrics(data []byte) {
-	reader := bytes.NewReader(data)
-	for {
-		mf := &dto.MetricFamily{}
-		size, err := readDelimited(reader, mf)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			panic(err)
-		}
-		if size == 0 {
-			break
-		}
-
-		fmt.Printf("Name: %s\n", mf.GetName())
+	for _, mf := range metrics {
+		fmt.Printf("Metric: %s\n", mf.GetName())
 		fmt.Printf("Help: %s\n", mf.GetHelp())
 		fmt.Printf("Type: %s\n", mf.GetType())
-
 		for _, m := range mf.GetMetric() {
-			fmt.Printf("  Labels: %v\n", m.GetLabel())
-			if m.Gauge != nil {
-				fmt.Printf("  Gauge: %f\n", m.Gauge.GetValue())
-			}
-			if m.Counter != nil {
-				fmt.Printf("  Counter: %f\n", m.Counter.GetValue())
-			}
-			// Add other metric types as needed
+			fmt.Printf("  Labels: %v\n", labelPairs(m.GetLabel()))
+			printMetricValue(m)
 		}
 		fmt.Println()
 	}
 }
 
-// The readDelimited function is designed to read Protocol Buffer messages that are encoded in a delimited format.
-// This format is used by Prometheus when sending metrics in binary form.
-//
-// Parameters:
-//   - r io.Reader: The source from which to read the delimited message.
-//   - m proto.Message: A Protocol Buffer message to unmarshal the data into.
-func readDelimited(r io.Reader, m proto.Message) (int, error) {
-	// a 1-byte buffer to read data one byte at a time.
-	buf := make([]byte, 1)
-	size := uint64(0)
-	// This loop implements varint decoding. Varints are used to encode integers using a variable number of bytes.
-	// Each byte uses 7 bits for the number and 1 bit to indicate if more bytes follow.
-	// - It reads one byte at a time.
-	// - The lower 7 bits of each byte are used to construct the size.
-	// - If the most significant bit (0x80) is set, it means another byte follows.
-	// - This continues until a byte with the most significant bit unset is found.
-	for shift := uint(0); ; shift += 7 {
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return 0, err
-		}
-		b := uint64(buf[0])
-		size |= (b & 0x7F) << shift
-		if (b & 0x80) == 0 {
+func parseBinaryMetrics(r io.Reader) ([]*dto.MetricFamily, error) {
+	var metrics []*dto.MetricFamily
+	reader := bufio.NewReader(r)
+
+	for {
+		length, err := binary.ReadUvarint(reader)
+		if err == io.EOF {
 			break
 		}
-	}
-	// After reading the size, if it's greater than 0, proceed to read the actual message:
-	if size > 0 {
-		buf = make([]byte, size)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return 0, err
+		if err != nil {
+			return nil, fmt.Errorf("error reading metric length: %v", err)
 		}
-		return int(size), proto.Unmarshal(buf, m)
+
+		buffer := make([]byte, length)
+		_, err = io.ReadFull(reader, buffer)
+		if err != nil {
+			return nil, fmt.Errorf("error reading metric data: %v", err)
+		}
+
+		var mf dto.MetricFamily
+		if err := proto.Unmarshal(buffer, &mf); err != nil {
+			return nil, fmt.Errorf("error unmarshaling metric family: %v", err)
+		}
+		metrics = append(metrics, &mf)
 	}
-	return 0, nil
+
+	return metrics, nil
+}
+
+func labelPairs(labels []*dto.LabelPair) string {
+	result := "{"
+	for i, label := range labels {
+		if i > 0 {
+			result += ", "
+		}
+		result += fmt.Sprintf("%s=%q", label.GetName(), label.GetValue())
+	}
+	result += "}"
+	return result
+}
+
+func printMetricValue(m *dto.Metric) {
+	switch {
+	case m.Gauge != nil:
+		fmt.Printf("  Gauge Value: %f\n", m.Gauge.GetValue())
+	case m.Counter != nil:
+		fmt.Printf("  Counter Value: %f\n", m.Counter.GetValue())
+	case m.Summary != nil:
+		fmt.Printf("  Summary:\n")
+		fmt.Printf("    Sample Count: %d\n", m.Summary.GetSampleCount())
+		fmt.Printf("    Sample Sum: %f\n", m.Summary.GetSampleSum())
+		for _, q := range m.Summary.GetQuantile() {
+			fmt.Printf("    Quantile %.2f: %f\n", q.GetQuantile(), q.GetValue())
+		}
+	case m.Histogram != nil:
+		fmt.Printf("  Histogram:\n")
+		fmt.Printf("    Sample Count: %d\n", m.Histogram.GetSampleCount())
+		fmt.Printf("    Sample Sum: %f\n", m.Histogram.GetSampleSum())
+		for _, b := range m.Histogram.GetBucket() {
+			fmt.Printf("    Bucket [%f]: %d\n", b.GetUpperBound(), b.GetCumulativeCount())
+		}
+	case m.Untyped != nil:
+		fmt.Printf("  Untyped Value: %f\n", m.Untyped.GetValue())
+	default:
+		fmt.Println("  Unknown metric type")
+	}
 }
